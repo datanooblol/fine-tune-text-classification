@@ -39,12 +39,53 @@
 - Sensitive to confidence threshold
 - May not converge
 
-**Example:**
+**Code Example:**
 ```python
-# Iteration 1: Train on 100 labeled
-# Iteration 2: Add 50 high-confidence predictions → Train on 150
-# Iteration 3: Add 30 more → Train on 180
-# Continue...
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+from datasets import Dataset
+import torch
+
+# Initial labeled data
+labeled_texts = ["spam text 1", "ham text 1", ...]
+labeled_labels = [1, 0, ...]
+unlabeled_texts = ["unknown text 1", "unknown text 2", ...]  # Large unlabeled set
+
+# Load model
+tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
+model = AutoModelForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=2)
+
+# Self-training loop
+for iteration in range(5):
+    # 1. Train on current labeled data
+    dataset = Dataset.from_dict({'text': labeled_texts, 'labels': labeled_labels})
+    dataset = dataset.map(lambda x: tokenizer(x['text'], truncation=True, padding=True), batched=True)
+    
+    trainer = Trainer(
+        model=model,
+        args=TrainingArguments(output_dir='./model', num_train_epochs=3),
+        train_dataset=dataset,
+        processing_class=tokenizer
+    )
+    trainer.train()
+    
+    # 2. Predict on unlabeled data
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    inputs = tokenizer(unlabeled_texts, truncation=True, padding=True, return_tensors="pt").to(device)
+    outputs = model(**inputs)
+    probs = torch.softmax(outputs.logits, dim=-1)
+    predictions = torch.argmax(probs, dim=-1)
+    confidences = torch.max(probs, dim=-1).values
+    
+    # 3. Add high-confidence predictions to labeled set
+    confidence_threshold = 0.9
+    for i, (text, pred, conf) in enumerate(zip(unlabeled_texts, predictions, confidences)):
+        if conf > confidence_threshold:
+            labeled_texts.append(text)
+            labeled_labels.append(pred.item())
+            unlabeled_texts.pop(i)
+    
+    print(f"Iteration {iteration}: Labeled set size = {len(labeled_texts)}")
 ```
 
 **Use when:** You have a small labeled set and want to gradually expand it.
@@ -70,11 +111,49 @@
 - More complex implementation
 - Computationally expensive
 
-**Example:**
+**Code Example:**
 ```python
-# View 1: Email text content
-# View 2: Email metadata (sender, time, subject length)
-# Model A (text) and Model B (metadata) train each other
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from datasets import Dataset
+import torch
+
+# Data with two views
+texts = ["email body 1", "email body 2", ...]  # View 1: Text
+metadata = [[10, 1, 5], [50, 0, 2], ...]  # View 2: [length, is_reply, num_links]
+labels = [1, 0, ...]  # Small labeled set
+unlabeled_texts = ["unlabeled email 1", ...]
+unlabeled_metadata = [[30, 1, 3], ...]
+
+# Model A: Text-based
+tokenizer_a = AutoTokenizer.from_pretrained('distilbert-base-uncased')
+model_a = AutoModelForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=2)
+
+# Model B: Metadata-based (simplified - would use a different architecture)
+model_b = AutoModelForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=2)
+
+# Co-training loop
+for iteration in range(5):
+    # 1. Train Model A on text + current labels
+    dataset_a = Dataset.from_dict({'text': texts, 'labels': labels})
+    dataset_a = dataset_a.map(lambda x: tokenizer_a(x['text'], truncation=True, padding=True), batched=True)
+    # ... train model_a ...
+    
+    # 2. Train Model B on metadata + current labels
+    # ... train model_b on metadata ...
+    
+    # 3. Model A predicts on unlabeled data
+    inputs_a = tokenizer_a(unlabeled_texts, truncation=True, padding=True, return_tensors="pt")
+    preds_a = torch.argmax(model_a(**inputs_a).logits, dim=-1)
+    
+    # 4. Model B predicts on unlabeled data
+    # preds_b = model_b.predict(unlabeled_metadata)
+    
+    # 5. Add examples where both models agree with high confidence
+    for i, (text, meta, pred_a) in enumerate(zip(unlabeled_texts, unlabeled_metadata, preds_a)):
+        # if pred_a == pred_b and confidence > threshold:
+        texts.append(text)
+        metadata.append(meta)
+        labels.append(pred_a.item())
 ```
 
 **Use when:** Your data has multiple independent feature representations.
@@ -99,11 +178,62 @@
 - No iterative refinement (unless repeated)
 - Can amplify initial errors
 
-**Example:**
+**Code Example:**
 ```python
-# Train on 100 labeled
-# Predict on 10,000 unlabeled → pseudo-labels
-# Train on 100 labeled + 10,000 pseudo-labeled (weighted)
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+from datasets import Dataset
+import torch
+
+# Data
+labeled_texts = ["spam 1", "ham 1", ...]  # 100 labeled
+labeled_labels = [1, 0, ...]
+unlabeled_texts = ["unknown 1", "unknown 2", ...]  # 10,000 unlabeled
+
+tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
+model = AutoModelForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=2)
+
+# Step 1: Train on labeled data
+dataset = Dataset.from_dict({'text': labeled_texts, 'labels': labeled_labels})
+dataset = dataset.map(lambda x: tokenizer(x['text'], truncation=True, padding=True), batched=True)
+
+trainer = Trainer(
+    model=model,
+    args=TrainingArguments(output_dir='./model', num_train_epochs=3),
+    train_dataset=dataset,
+    processing_class=tokenizer
+)
+trainer.train()
+
+# Step 2: Generate pseudo-labels for unlabeled data
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = model.to(device)
+inputs = tokenizer(unlabeled_texts, truncation=True, padding=True, return_tensors="pt").to(device)
+outputs = model(**inputs)
+pseudo_labels = torch.argmax(outputs.logits, dim=-1).cpu().tolist()
+
+# Step 3: Combine labeled + pseudo-labeled data
+all_texts = labeled_texts + unlabeled_texts
+all_labels = labeled_labels + pseudo_labels
+
+# Create sample weights (true labels = 1.0, pseudo-labels = 0.3)
+sample_weights = [1.0] * len(labeled_texts) + [0.3] * len(unlabeled_texts)
+
+# Step 4: Retrain on combined data
+combined_dataset = Dataset.from_dict({
+    'text': all_texts, 
+    'labels': all_labels,
+    'weight': sample_weights
+})
+combined_dataset = combined_dataset.map(lambda x: tokenizer(x['text'], truncation=True, padding=True), batched=True)
+
+# Retrain with weighted loss (requires custom Trainer)
+trainer = Trainer(
+    model=model,
+    args=TrainingArguments(output_dir='./model_pseudo', num_train_epochs=3),
+    train_dataset=combined_dataset,
+    processing_class=tokenizer
+)
+trainer.train()
 ```
 
 **Use when:** You have a decent initial model and lots of unlabeled data.
@@ -130,11 +260,77 @@
 - Requires assumptions about data distribution
 - Fewer off-the-shelf implementations
 
-**Example:**
+**Code Example:**
 ```python
-# 20 known spam emails (positive)
-# 80 unlabeled emails (some are spam, some are not)
-# Goal: Identify all spam without labeled "not spam" examples
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+from datasets import Dataset
+import torch
+
+# PU Learning data
+positive_texts = ["spam 1", "spam 2", ...]  # 20 known positives
+unlabeled_texts = ["unknown 1", "unknown 2", ...]  # 80 unlabeled (mix of positive and negative)
+
+tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
+model = AutoModelForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=2)
+
+# Step 1: Initial training - treat unlabeled as negative (with lower weight)
+train_texts = positive_texts + unlabeled_texts
+train_labels = [1] * len(positive_texts) + [0] * len(unlabeled_texts)
+
+# Create sample weights (positives = 1.0, unlabeled = 0.1)
+sample_weights = [1.0] * len(positive_texts) + [0.1] * len(unlabeled_texts)
+
+dataset = Dataset.from_dict({
+    'text': train_texts,
+    'labels': train_labels,
+    'weight': sample_weights
+})
+dataset = dataset.map(lambda x: tokenizer(x['text'], truncation=True, padding=True), batched=True)
+
+trainer = Trainer(
+    model=model,
+    args=TrainingArguments(output_dir='./pu_model', num_train_epochs=3),
+    train_dataset=dataset,
+    processing_class=tokenizer
+)
+trainer.train()
+
+# Step 2: Predict on unlabeled data
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = model.to(device)
+inputs = tokenizer(unlabeled_texts, truncation=True, padding=True, return_tensors="pt").to(device)
+outputs = model(**inputs)
+probs = torch.softmax(outputs.logits, dim=-1)
+predictions = torch.argmax(probs, dim=-1)
+confidences = probs[:, 1]  # Confidence for positive class
+
+# Step 3: Identify reliable positives and negatives
+reliable_positives = []
+reliable_negatives = []
+
+for text, pred, conf in zip(unlabeled_texts, predictions, confidences):
+    if pred == 1 and conf > 0.9:  # High confidence positive
+        reliable_positives.append(text)
+    elif pred == 0 and conf < 0.1:  # High confidence negative
+        reliable_negatives.append(text)
+
+# Step 4: Retrain with reliable labels
+final_texts = positive_texts + reliable_positives + reliable_negatives
+final_labels = [1] * (len(positive_texts) + len(reliable_positives)) + [0] * len(reliable_negatives)
+
+final_dataset = Dataset.from_dict({'text': final_texts, 'labels': final_labels})
+final_dataset = final_dataset.map(lambda x: tokenizer(x['text'], truncation=True, padding=True), batched=True)
+
+trainer = Trainer(
+    model=model,
+    args=TrainingArguments(output_dir='./pu_model_final', num_train_epochs=3),
+    train_dataset=final_dataset,
+    processing_class=tokenizer
+)
+trainer.train()
+
+print(f"Reliable positives found: {len(reliable_positives)}")
+print(f"Reliable negatives found: {len(reliable_negatives)}")
 ```
 
 **Use when:** You only have positive labels and unlabeled data (no confirmed negatives).
