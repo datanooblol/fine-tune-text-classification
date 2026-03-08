@@ -17,6 +17,8 @@ dependencies = [
     "scikit-learn>=1.8.0",
     "matplotlib>=3.10.8",
     "peft>=0.18.1",
+    "sentence-transformers>=5.2.3",
+    "pythainlp>=5.2.0",
 ]
 
 [dependency-groups]
